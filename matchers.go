@@ -265,3 +265,60 @@ func matchHTTP2Field(w io.Writer, r io.Reader, name string, matches func(string)
 		}
 	}
 }
+
+const grpcHeaderKey = "content-type"
+const grpcHeaderValue = "application/grpc"
+
+func HTTP2MatchGRPCSendSettings(w io.Writer, r io.Reader) bool {
+	matched := false
+	if !hasHTTP2Preface(r) {
+		return false
+	}
+
+	done := false
+	framer := http2.NewFramer(w, r)
+	hdec := hpack.NewDecoder(uint32(4<<10), func(hf hpack.HeaderField) {
+		if hf.Name == grpcHeaderKey {
+			done = true
+			if hf.Value == grpcHeaderValue {
+				matched = true
+			}
+		}
+	})
+	for {
+		f, err := framer.ReadFrame()
+		if err != nil {
+			return false
+		}
+
+		switch f := f.(type) {
+		case *http2.SettingsFrame:
+			// Sender acknoweldged the SETTINGS frame. No need to write
+			// SETTINGS again.
+			if f.IsAck() {
+				break
+			}
+			// grpc settings frame will always be 0 length (?)
+			if f.Length != 0 {
+				break
+			}
+			if err := framer.WriteSettings(); err != nil {
+				return false
+			}
+		case *http2.ContinuationFrame:
+			if _, err := hdec.Write(f.HeaderBlockFragment()); err != nil {
+				return false
+			}
+			done = done || f.FrameHeader.Flags&http2.FlagHeadersEndHeaders != 0
+		case *http2.HeadersFrame:
+			if _, err := hdec.Write(f.HeaderBlockFragment()); err != nil {
+				return false
+			}
+			done = done || f.FrameHeader.Flags&http2.FlagHeadersEndHeaders != 0
+		}
+
+		if done {
+			return matched
+		}
+	}
+}
